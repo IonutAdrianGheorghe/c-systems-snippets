@@ -1,5 +1,5 @@
-#include "rbspsc.h"
-#include <threads.h>
+#include "../include/rbspsc.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +7,7 @@
 
 typedef struct { rbspsc_t* rb; size_t N; atomic_ulong checksum; } ctx_t;
 
-int producer(void* arg){
+static void* producer(void* arg){
     ctx_t* c = (ctx_t*)arg;
     uint8_t buf[4096];
     size_t produced = 0;
@@ -20,10 +20,10 @@ int producer(void* arg){
         for(size_t i=0;i<w;i++) atomic_fetch_add(&c->checksum, buf[i]);
         produced += w;
     }
-    return 0;
+    return NULL;
 }
 
-int consumer(void* arg){
+static void* consumer(void* arg){
     ctx_t* c = (ctx_t*)arg;
     uint8_t buf[4096];
     size_t consumed = 0;
@@ -36,9 +36,9 @@ int consumer(void* arg){
     unsigned long prod = atomic_load(&c->checksum);
     if(sum != prod){
         fprintf(stderr, "Checksum mismatch: cons=%lu prod=%lu\n", sum, prod);
-        return 1;
+        return (void*)1;
     }
-    return 0;
+    return NULL;
 }
 
 int main(){
@@ -46,16 +46,16 @@ int main(){
     if(rbspsc_init(&rb, 1<<16) != 0){ fprintf(stderr,"init failed\n"); return 1; }
     ctx_t ctx = { .rb=&rb, .N=10u*1024u*1024u, .checksum=0 }; // 10 MB
 
-    thrd_t tp, tc;
-    thrd_create(&tp, producer, &ctx);
-    thrd_create(&tc, consumer, &ctx);
+    pthread_t tp, tc;
+    pthread_create(&tp, NULL, producer, &ctx);
+    pthread_create(&tc, NULL, consumer, &ctx);
 
-    int rp, rc;
-    thrd_join(tp, &rp);
-    thrd_join(tc, &rc);
+    void* rp; void* rc;
+    pthread_join(tp, &rp);
+    pthread_join(tc, &rc);
 
     rbspsc_free(&rb);
-    if(rp!=0 || rc!=0){ fprintf(stderr,"threads failed\n"); return 1; }
+    if(rp!=NULL || rc!=NULL){ fprintf(stderr,"threads failed\n"); return 1; }
     puts("SPSC ring buffer correctness: OK");
     return 0;
 }
