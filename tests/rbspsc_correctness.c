@@ -1,61 +1,51 @@
-#include "../include/rbspsc.h"
+#include "rbspsc.h"
 #include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 
-typedef struct { rbspsc_t* rb; size_t N; atomic_ulong checksum; } ctx_t;
+typedef struct {
+    rbspsc_t* rb;
+    size_t N;
+    atomic_size_t produced, consumed;
+    atomic_int error;
+} ctx_t;
+
+static void fill_pattern(uint8_t* dst, size_t off, size_t len){
+    for(size_t i=0;i<len;i++) dst[i]=(uint8_t)((off+i)&0xFF);
+}
 
 static void* producer(void* arg){
-    ctx_t* c = (ctx_t*)arg;
-    uint8_t buf[4096];
-    size_t produced = 0;
-    while(produced < c->N){
-        size_t chunk = sizeof(buf);
-        if(chunk > (c->N - produced)) chunk = c->N - produced;
-        for(size_t i=0;i<chunk;i++) buf[i] = (uint8_t)((produced+i) & 0xFF);
-        size_t w = 0;
-        while(w == 0) w = rbspsc_push(c->rb, buf, chunk);
-        for(size_t i=0;i<w;i++) atomic_fetch_add(&c->checksum, buf[i]);
-        produced += w;
+    ctx_t* c=(ctx_t*)arg; uint8_t buf[4096];
+    while(atomic_load(&c->produced)<c->N){
+        size_t off=atomic_load(&c->produced);
+        size_t chunk=sizeof(buf); if(chunk>c->N-off) chunk=c->N-off;
+        fill_pattern(buf, off, chunk);
+        size_t w=rbspsc_push(c->rb, buf, chunk);
+        if(!w){ sched_yield(); continue; }
+        atomic_fetch_add(&c->produced, w);
     }
     return NULL;
 }
-
 static void* consumer(void* arg){
-    ctx_t* c = (ctx_t*)arg;
-    uint8_t buf[4096];
-    size_t consumed = 0;
-    unsigned long sum = 0;
-    while(consumed < c->N){
-        size_t r = rbspsc_pop(c->rb, buf, sizeof(buf));
-        for(size_t i=0;i<r;i++) sum += buf[i];
-        consumed += r;
-    }
-    unsigned long prod = atomic_load(&c->checksum);
-    if(sum != prod){
-        fprintf(stderr, "Checksum mismatch: cons=%lu prod=%lu\n", sum, prod);
-        return (void*)1;
+    ctx_t* c=(ctx_t*)arg; uint8_t buf[4096], exp[4096];
+    while(atomic_load(&c->consumed)<c->N){
+        size_t off=atomic_load(&c->consumed);
+        size_t r=rbspsc_pop(c->rb, buf, sizeof(buf));
+        if(!r){ sched_yield(); continue; }
+        fill_pattern(exp, off, r);
+        if(memcmp(buf, exp, r)!=0){ fprintf(stderr,"Data mismatch @%zu\n", off); atomic_store(&c->error,1); break; }
+        atomic_fetch_add(&c->consumed, r);
     }
     return NULL;
 }
 
-int main(){
-    rbspsc_t rb;
-    if(rbspsc_init(&rb, 1<<16) != 0){ fprintf(stderr,"init failed\n"); return 1; }
-    ctx_t ctx = { .rb=&rb, .N=10u*1024u*1024u, .checksum=0 }; // 10 MB
-
-    pthread_t tp, tc;
-    pthread_create(&tp, NULL, producer, &ctx);
-    pthread_create(&tc, NULL, consumer, &ctx);
-
-    void* rp; void* rc;
-    pthread_join(tp, &rp);
-    pthread_join(tc, &rc);
-
-    rbspsc_free(&rb);
-    if(rp!=NULL || rc!=NULL){ fprintf(stderr,"threads failed\n"); return 1; }
-    puts("SPSC ring buffer correctness: OK");
-    return 0;
+int main(void){
+    rbspsc_t rb; if(rbspsc_init(&rb, 1<<16)!=0){ fprintf(stderr,"init failed\n"); return 1; }
+    ctx_t ctx={ .rb=&rb, .N=10u*1024u*1024u, .produced=0, .consumed=0, .error=0 };
+    pthread_t tp, tc; pthread_create(&tp,NULL,producer,&ctx); pthread_create(&tc,NULL,consumer,&ctx);
+    pthread_join(tp,NULL); pthread_join(tc,NULL); rbspsc_free(&rb);
+    if(atomic_load(&ctx.error)) return 1;
+    if(ctx.produced!=ctx.consumed || ctx.produced!=ctx.N) return 1;
+    puts("SPSC ring buffer correctness: OK"); return 0;
 }
